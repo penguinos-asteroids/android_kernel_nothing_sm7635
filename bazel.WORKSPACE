@@ -34,3 +34,14 @@ new_local_repository(
     path = "external/dtc",
     build_file = "msm-kernel/BUILD.dtc",
 )
+
+local_repository(
+    name = "rules_pkg",
+    path = "external/bazelbuild-rules_pkg",
+)
+
+new_local_repository(
+    name = "rules_devicetree",
+    path = "external/bazel-contrib-rules_devicetree",
+    build_file = "external/bazel-contrib-rules_devicetree/BUILD.bazel",
+)

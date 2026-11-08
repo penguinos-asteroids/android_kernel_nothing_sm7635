@@ -86,3 +86,6 @@ obj-$(CONFIG_NT_SECURE_STATE)		+= secure_state.o
 obj-$(CONFIG_NT_RPMB_STATE)		+= rpmb_state.o
 obj-$(CONFIG_NOTH_HARDWARE_ID)  += hardware_id.o
 obj-$(CONFIG_VD628x)      += vd628x/
+obj-$(CONFIG_USBMUX_PS8822)     += usbmux_ps8822.o
+obj-$(CONFIG_CCI_UTIL)          += dpin_cci_util.o
+obj-$(CONFIG_LONTIUM_LT7911UXC) += lontium-lt7911uxc.o

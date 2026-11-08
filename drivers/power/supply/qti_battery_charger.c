@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt)	"BATTERY_CHG: %s: " fmt, __func__
@@ -9,6 +9,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/extcon-provider.h>
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -23,6 +24,7 @@
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/soc/qcom/battery_charger.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
+#include "qti_typec_class.h"
 #ifndef NT_EDIT
 #define NT_EDIT
 #endif
@@ -140,6 +142,11 @@ enum usb_port_id {
 	USB_1_PORT_ID,
 	USB_2_PORT_ID,
 	NUM_USB_PORTS,
+};
+
+enum usb_connector_type {
+	USB_CONNECTOR_TYPE_TYPEC,
+	USB_CONNECTOR_TYPE_MICRO_USB,
 };
 
 enum psy_type {
@@ -378,6 +385,7 @@ struct battery_chg_dev {
 	struct device			*dev;
 	struct class			battery_class;
 	struct pmic_glink_client	*client;
+	struct typec_role_class		*typec_class;
 	struct mutex			rw_lock;
 	struct rw_semaphore		state_sem;
 	struct completion		ack;
@@ -386,6 +394,8 @@ struct battery_chg_dev {
 	struct psy_state		psy_list[PSY_TYPE_MAX];
 	struct dentry			*debugfs_dir;
 	void				*notifier_cookie;
+	/* extcon for VBUS/ID notification for USB for micro USB */
+	struct extcon_dev		*extcon;
 	u32				*thermal_levels;
 	const char			*wls_fw_name;
 	int				curr_thermal_level;
@@ -423,6 +433,8 @@ struct battery_chg_dev {
 	u32				last_fcc_ua;
 	u32				usb_icl_ua[NUM_USB_PORTS];
 	u32				thermal_fcc_step;
+	u32				connector_type;
+	u32				usb_prev_mode;
 	bool				restrict_chg_en;
 	u8				chg_ctrl_start_thr;
 	u8				chg_ctrl_end_thr;
@@ -437,7 +449,8 @@ struct battery_chg_dev {
 	u32				chg_data_id;
 #endif
 
-	unsigned int			num_usb_ports;
+	bool				micro_usb;
+	u32				num_usb_ports;
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -477,6 +490,7 @@ static const int usb_prop_map[USB_PROP_MAX] = {
 	[USB_INPUT_CURR_LIMIT]	= POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	[USB_ADAP_TYPE]		= POWER_SUPPLY_PROP_USB_TYPE,
 	[USB_TEMP]		= POWER_SUPPLY_PROP_TEMP,
+	[USB_SCOPE]		= POWER_SUPPLY_PROP_SCOPE,
 };
 
 static const int wls_prop_map[WLS_PROP_MAX] = {
@@ -487,6 +501,12 @@ static const int wls_prop_map[WLS_PROP_MAX] = {
 	[WLS_CURR_MAX]		= POWER_SUPPLY_PROP_CURRENT_MAX,
 	[WLS_INPUT_CURR_LIMIT]	= POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	[WLS_CONN_TEMP]		= POWER_SUPPLY_PROP_TEMP,
+};
+
+static const unsigned int bcdev_usb_extcon_cable[] = {
+	EXTCON_USB,
+	EXTCON_USB_HOST,
+	EXTCON_NONE,
 };
 
 /* Standard usb_type definitions similar to power_supply_sysfs.c */
@@ -957,6 +977,71 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 		complete(&bcdev->ack);
 }
 
+static void battery_chg_update_uusb_type(struct battery_chg_dev *bcdev,
+					 u32 adap_type)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
+	int rc;
+	u32 scope;
+
+	/* Handle the extcon notification for uUSB case only */
+	if ((bcdev->connector_type != USB_CONNECTOR_TYPE_MICRO_USB) ||
+	    !bcdev->extcon)
+		return;
+
+	if (IS_ENABLED(CONFIG_QTI_TYPEC_CLASS)) {
+		if (!bcdev->typec_class)
+			return;
+	}
+
+	rc = read_property_id(bcdev, pst, USB_SCOPE);
+	if (rc < 0) {
+		dev_err(bcdev->dev, "Failed to read USB_SCOPE rc=%d\n", rc);
+		return;
+	}
+	scope = pst->prop[USB_SCOPE];
+
+	switch (scope) {
+	case POWER_SUPPLY_SCOPE_DEVICE:
+		if (adap_type == POWER_SUPPLY_USB_TYPE_SDP ||
+		    adap_type == POWER_SUPPLY_USB_TYPE_CDP) {
+			/* Device mode connect notification */
+			extcon_set_state_sync(bcdev->extcon, EXTCON_USB, 1);
+			bcdev->usb_prev_mode = EXTCON_USB;
+			if (IS_ENABLED(CONFIG_QTI_TYPEC_CLASS)) {
+				rc = qti_typec_partner_register(bcdev->typec_class,
+								TYPEC_DEVICE);
+				if (rc < 0)
+					dev_err(bcdev->dev,
+						"Failed to register typec partner rc=%d\n", rc);
+			}
+		}
+		break;
+	case POWER_SUPPLY_SCOPE_SYSTEM:
+		/* Host mode connect notification */
+		extcon_set_state_sync(bcdev->extcon, EXTCON_USB_HOST, 1);
+		bcdev->usb_prev_mode = EXTCON_USB_HOST;
+		if (IS_ENABLED(CONFIG_QTI_TYPEC_CLASS)) {
+			rc = qti_typec_partner_register(bcdev->typec_class, TYPEC_HOST);
+			if (rc < 0)
+				dev_err(bcdev->dev, "Failed to register typec partner rc=%d\n",
+					rc);
+		}
+		break;
+	default:
+		if (bcdev->usb_prev_mode == EXTCON_USB ||
+		    bcdev->usb_prev_mode == EXTCON_USB_HOST) {
+			/* Disconnect notification */
+			extcon_set_state_sync(bcdev->extcon,
+					      bcdev->usb_prev_mode, 0);
+			bcdev->usb_prev_mode = EXTCON_NONE;
+			if (IS_ENABLED(CONFIG_QTI_TYPEC_CLASS))
+				qti_typec_partner_unregister(bcdev->typec_class);
+		}
+		break;
+	}
+}
+
 static struct power_supply_desc usb_psy_desc[NUM_USB_PORTS];
 
 static void battery_chg_update_usb_type_work(struct work_struct *work)
@@ -1030,6 +1115,9 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 			break;
 		}
 	}
+
+	if (bcdev->micro_usb)
+		battery_chg_update_uusb_type(bcdev, pst->prop[USB_ADAP_TYPE]);
 }
 
 #ifdef NT_EDIT
@@ -2983,6 +3071,18 @@ static enum power_supply_property usb_props[] = {
 	POWER_SUPPLY_PROP_TEMP,
 };
 
+static enum power_supply_property uusb_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_SCOPE,
+};
+
 static enum power_supply_usb_type usb_psy_supported_types[] = {
 	POWER_SUPPLY_USB_TYPE_UNKNOWN,
 	POWER_SUPPLY_USB_TYPE_SDP,
@@ -3326,6 +3426,11 @@ static int battery_chg_init_psy(struct battery_chg_dev *bcdev)
 
 	psy_cfg.drv_data = bcdev;
 	psy_cfg.of_node = bcdev->dev->of_node;
+	if (bcdev->micro_usb) {
+		usb_psy_desc[USB_1_PORT_ID].properties = uusb_props;
+		usb_psy_desc[USB_1_PORT_ID].num_properties = ARRAY_SIZE(uusb_props);
+	}
+
 	bcdev->psy_list[PSY_TYPE_USB].psy =
 		devm_power_supply_register(bcdev->dev, &usb_psy_desc[USB_1_PORT_ID], &psy_cfg);
 	if (IS_ERR(bcdev->psy_list[PSY_TYPE_USB].psy)) {
@@ -3335,19 +3440,18 @@ static int battery_chg_init_psy(struct battery_chg_dev *bcdev)
 		return rc;
 	}
 
-	pst = &bcdev->psy_list[PSY_TYPE_USB];
-	rc = read_property_id(bcdev, pst, USB_NUM_PORTS);
-	if (rc < 0) {
-		pr_debug("Failed to read prop USB_NUM_PORTS, rc=%d\n", rc);
-		bcdev->num_usb_ports = 1;
-	} else if (pst->prop[USB_NUM_PORTS] > NUM_USB_PORTS) {
-		pr_err("Number of USB ports detected as supported:%d, greater than 2\n",
-			pst->prop[USB_NUM_PORTS]);
-		return -EINVAL;
-	} else if (pst->prop[USB_NUM_PORTS] != bcdev->num_usb_ports) {
-		pr_err("Number of USB ports detected as supported:%d, configured in apps:%d\n",
-			pst->prop[USB_NUM_PORTS], bcdev->num_usb_ports);
-		bcdev->num_usb_ports = 1;
+	if (bcdev->num_usb_ports > 1) {
+		pst = &bcdev->psy_list[PSY_TYPE_USB];
+		rc = read_property_id(bcdev, pst, USB_NUM_PORTS);
+		if (rc < 0) {
+			pr_debug("Failed to read prop USB_NUM_PORTS, rc=%d\n", rc);
+		} else if (pst->prop[USB_NUM_PORTS] > NUM_USB_PORTS) {
+			pr_err("Number of USB ports detected as supported:%d, greater than 2\n",
+				pst->prop[USB_NUM_PORTS]);
+		} else if (pst->prop[USB_NUM_PORTS] != bcdev->num_usb_ports) {
+			pr_err("Number of USB ports detected as supported:%d, configured in apps:%d\n",
+				pst->prop[USB_NUM_PORTS], bcdev->num_usb_ports);
+		}
 	}
 
 	if (bcdev->num_usb_ports == 2) {
@@ -4131,10 +4235,6 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 		bcdev->chg_data_id = CHG_DATA_ID_DEF_VAL;
 	}
 #endif
-	if (of_property_read_bool(bcdev->dev->of_node, "qcom,multiport-usb"))
-		bcdev->num_usb_ports = 2;
-	else
-		bcdev->num_usb_ports = 1;
 
 	rc = read_property_id(bcdev, pst, BATT_CHG_CTRL_LIM_MAX);
 	if (rc < 0) {
@@ -4359,6 +4459,60 @@ static const struct thermal_cooling_device_ops battery_tcd_ops = {
 	.set_cur_state = battery_chg_set_cur_charge_cntl_limit,
 };
 
+static int register_extcon_conn_type(struct battery_chg_dev *bcdev)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
+	int rc;
+
+	if (!bcdev->micro_usb)
+		return 0;
+
+	rc = read_property_id(bcdev, pst, USB_CONNECTOR_TYPE);
+	if (rc < 0) {
+		dev_err(bcdev->dev, "Failed to read prop USB_CONNECTOR_TYPE, rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	if (pst->prop[USB_CONNECTOR_TYPE] != USB_CONNECTOR_TYPE_MICRO_USB)
+		return 0;
+
+	bcdev->connector_type = USB_CONNECTOR_TYPE_MICRO_USB;
+	bcdev->usb_prev_mode = EXTCON_NONE;
+
+	bcdev->extcon = devm_extcon_dev_allocate(bcdev->dev,
+						bcdev_usb_extcon_cable);
+	if (IS_ERR(bcdev->extcon)) {
+		rc = PTR_ERR(bcdev->extcon);
+		dev_err(bcdev->dev, "Failed to allocate extcon device rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	rc = devm_extcon_dev_register(bcdev->dev, bcdev->extcon);
+	if (rc < 0) {
+		dev_err(bcdev->dev, "Failed to register extcon device rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	rc = extcon_set_property_capability(bcdev->extcon, EXTCON_USB,
+					    EXTCON_PROP_USB_SS);
+	if (rc < 0) {
+		dev_err(bcdev->dev, "Failed to set USB property capability, rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	rc = extcon_set_property_capability(bcdev->extcon,
+					    EXTCON_USB_HOST, EXTCON_PROP_USB_SS);
+	if (rc < 0)
+		dev_err(bcdev->dev, "Failed to set USB_HOST property capability, rc=%d\n",
+			rc);
+
+	return rc;
+}
+
 static int battery_chg_probe(struct platform_device *pdev)
 {
 	struct battery_chg_dev *bcdev;
@@ -4389,12 +4543,26 @@ static int battery_chg_probe(struct platform_device *pdev)
 	bcdev->psy_list[PSY_TYPE_WLS].opcode_set = BC_WLS_STATUS_SET;
 	bcdev->usb_active[USB_1_PORT_ID] = true;
 
-	bcdev->psy_list[PSY_TYPE_USB_2].map = usb_prop_map;
-	bcdev->psy_list[PSY_TYPE_USB_2].prop_count = USB_PROP_MAX;
-	bcdev->psy_list[PSY_TYPE_USB_2].opcode_get = BC_USB_STATUS_GET(USB_2_PORT_ID);
-	bcdev->psy_list[PSY_TYPE_USB_2].opcode_set = BC_USB_STATUS_SET(USB_2_PORT_ID);
+	rc = of_property_read_u32(dev->of_node, "qcom,multiport-usb", &bcdev->num_usb_ports);
+	if (rc < 0)
+		bcdev->num_usb_ports = 1;
+
+	if (bcdev->num_usb_ports > NUM_USB_PORTS) {
+		dev_err(dev, "Invalid num_usb_ports %d, maximum is %d\n",
+				bcdev->num_usb_ports, NUM_USB_PORTS);
+		return -EINVAL;
+	}
+
+	if (bcdev->num_usb_ports == 2) {
+		bcdev->psy_list[PSY_TYPE_USB_2].map = usb_prop_map;
+		bcdev->psy_list[PSY_TYPE_USB_2].prop_count = USB_PROP_MAX;
+		bcdev->psy_list[PSY_TYPE_USB_2].opcode_get = BC_USB_STATUS_GET(USB_2_PORT_ID);
+		bcdev->psy_list[PSY_TYPE_USB_2].opcode_set = BC_USB_STATUS_SET(USB_2_PORT_ID);
+	}
 
 	for (i = 0; i < PSY_TYPE_MAX; i++) {
+		if (i == PSY_TYPE_USB_2 && bcdev->num_usb_ports < 2)
+			continue;
 		bcdev->psy_list[i].prop =
 			devm_kcalloc(&pdev->dev, bcdev->psy_list[i].prop_count,
 					sizeof(u32), GFP_KERNEL);
@@ -4419,10 +4587,6 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_WORK(&bcdev->nt_update_event, nt_update_event_work);
 #endif
 	bcdev->dev = dev;
-
-	rc = battery_chg_register_panel_notifier(bcdev);
-	if (rc < 0)
-		return rc;
 
 	client_data.id = MSG_OWNER_BC;
 	client_data.name = "battery_charger";
@@ -4476,6 +4640,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	bcdev->restrict_fcc_ua = DEFAULT_RESTRICT_FCC_UA;
 	platform_set_drvdata(pdev, bcdev);
 	bcdev->fake_soc = -EINVAL;
+	bcdev->micro_usb = of_property_read_bool(bcdev->dev->of_node, "qcom,micro-usb");
 	rc = battery_chg_init_psy(bcdev);
 	if (rc < 0)
 		goto error;
@@ -4531,11 +4696,46 @@ static int battery_chg_probe(struct platform_device *pdev)
 	queue_delayed_work(system_wq, &bcdev->nt_update_status_work,
 								round_jiffies(10 * HZ));
 #endif
+	rc = register_extcon_conn_type(bcdev);
+	if (rc < 0) {
+		if (bcdev->connector_type == USB_CONNECTOR_TYPE_MICRO_USB) {
+			dev_err(dev, "Failed to register extcon for micro USB, rc=%d\n",
+				rc);
+			goto error;
+		} else {
+			dev_warn(dev, "Failed to register extcon rc=%d\n", rc);
+		}
+	}
+
+	if (IS_ENABLED(CONFIG_QTI_TYPEC_CLASS)) {
+		if (bcdev->connector_type == USB_CONNECTOR_TYPE_MICRO_USB) {
+			bcdev->typec_class = qti_typec_class_init(bcdev->dev);
+			if (IS_ERR_OR_NULL(bcdev->typec_class)) {
+				rc = PTR_ERR_OR_ZERO(bcdev->typec_class);
+				dev_err(dev, "Failed to init typec class err=%d\n", rc);
+				goto error;
+			}
+		}
+	}
+
 	schedule_work(&bcdev->usb_type_work);
 
 	rc = get_charge_control_en(bcdev);
 	if (rc < 0)
 		pr_debug("Failed to read charge_control_en, rc = %d\n", rc);
+
+	/*
+	 * Register panel notifier last, only after bcdev is fully
+	 * initialized. This ensures panel callbacks cannot race against
+	 * a partially-initialized or failed bcdev.
+	 */
+	rc = battery_chg_register_panel_notifier(bcdev);
+	if (rc < 0) {
+		device_init_wakeup(bcdev->dev, false);
+		debugfs_remove_recursive(bcdev->debugfs_dir);
+		class_unregister(&bcdev->battery_class);
+		goto error;
+	}
 
 	return 0;
 error:
@@ -4550,6 +4750,8 @@ error:
 	cancel_work_sync(&bcdev->battery_check_work);
 	complete(&bcdev->ack);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
+	if (bcdev->typec_class)
+		qti_typec_class_deinit(bcdev->typec_class);
 reg_error:
 	if (bcdev->notifier_cookie)
 		panel_event_notifier_unregister(bcdev->notifier_cookie);
@@ -4576,6 +4778,8 @@ static int battery_chg_remove(struct platform_device *pdev)
 	cancel_work_sync(&bcdev->usb_type_work);
 	cancel_work_sync(&bcdev->battery_check_work);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
+	if (bcdev->typec_class)
+		qti_typec_class_deinit(bcdev->typec_class);
 
 	return 0;
 }

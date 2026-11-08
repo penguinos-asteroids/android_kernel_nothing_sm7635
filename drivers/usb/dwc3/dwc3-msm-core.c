@@ -3859,15 +3859,20 @@ static bool dwc3_msm_orientation_gpio_init(struct dwc3_msm *mdwc)
 	int rc;
 
 	mdwc->orientation_gpio = of_get_gpio(dev->of_node, 0);
+	/*
+	 * If the GPIO is not defined or invalid, simply disable the
+	 * orientation feature - this is not an error condition.
+	 */
 	if (!gpio_is_valid(mdwc->orientation_gpio)) {
-		dev_err(dev, "Failed to get gpio\n");
+		dev_dbg(dev, "orientation GPIO not defined, feature disabled\n");
+		mdwc->orientation_gpio = -EINVAL;
 		return false;
 	}
 
 	rc = devm_gpio_request_one(dev, mdwc->orientation_gpio,
 				   GPIOF_IN, "dwc3-msm-orientation");
 	if (rc < 0) {
-		dev_err(dev, "Failed to request gpio\n");
+		dev_err(dev, "failed to request orientation GPIO, ret=%d\n", rc);
 		mdwc->orientation_gpio = -EINVAL;
 		return false;
 	}
@@ -5162,8 +5167,10 @@ static int dwc3_msm_extcon_register(struct dwc3_msm *mdwc)
 
 	for (idx = 0; idx < extcon_cnt; idx++) {
 		edev = extcon_get_edev_by_phandle(mdwc->dev, idx);
-		if (IS_ERR(edev) && PTR_ERR(edev) != -ENODEV)
-			return PTR_ERR(edev);
+		if (IS_ERR(edev) && PTR_ERR(edev) != -ENODEV) {
+			ret = PTR_ERR(edev);
+			goto err_unregister;
+		}
 
 		if (IS_ERR_OR_NULL(edev))
 			continue;
@@ -5209,6 +5216,17 @@ static int dwc3_msm_extcon_register(struct dwc3_msm *mdwc)
 	}
 
 	return 0;
+
+err_unregister:
+	while (--idx >= 0) {
+		if (!mdwc->extcon[idx].edev)
+			continue;
+		extcon_unregister_notifier(mdwc->extcon[idx].edev, EXTCON_USB,
+						&mdwc->extcon[idx].vbus_nb);
+		extcon_unregister_notifier(mdwc->extcon[idx].edev, EXTCON_USB_HOST,
+						&mdwc->extcon[idx].id_nb);
+	}
+	return ret;
 }
 
 static inline const char *dwc3_msm_usb_role_string(enum usb_role role)
@@ -6324,7 +6342,7 @@ static int dwc3_msm_register_interrupts(struct platform_device *pdev)
 	int i;
 
 	for (i = 0; i < USB_MAX_IRQ; i++) {
-		mdwc->wakeup_irq[i].irq = platform_get_irq_byname(pdev,
+		mdwc->wakeup_irq[i].irq = platform_get_irq_byname_optional(pdev,
 					usb_irq_info[i].name);
 		if (mdwc->wakeup_irq[i].irq < 0) {
 			/* pwr_evnt_irq is only mandatory irq */
