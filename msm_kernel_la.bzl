@@ -495,7 +495,8 @@ def define_msm_la(
             content = [vendor_unprotected_dlkm, ""],
         )
 
-    in_tree_module_list += vendor_dlkm_module_unprotected_list
+    if vendor_dlkm_module_unprotected_list:
+        in_tree_module_list += vendor_dlkm_module_unprotected_list
 
     _define_build_config(
         msm_target,
